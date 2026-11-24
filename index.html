@@ -1,0 +1,253 @@
+import cv2
+import csv
+import os
+import threading
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from collections import defaultdict
+import numpy as np
+
+APP_TITLE = "Artemia Bio-Indicator V2 Auto"
+# Prototype: detects moving image regions; overlapping/stationary Artemia may be missed.
+
+class CentroidTracker:
+    def __init__(self, max_distance=35, max_missing=8):
+        self.next_id = 1
+        self.objects = {}
+        self.missing = {}
+        self.max_distance = max_distance
+        self.max_missing = max_missing
+
+    def update(self, detections):
+        assigned = {}
+        used = set()
+        # Greedy nearest-neighbour association
+        candidates = []
+        for oid, (ox, oy) in self.objects.items():
+            for j, (x, y, area, box) in enumerate(detections):
+                d = float(np.hypot(ox-x, oy-y))
+                if d <= self.max_distance:
+                    candidates.append((d, oid, j))
+        for _, oid, j in sorted(candidates):
+            if oid not in used and j not in assigned:
+                assigned[j] = oid
+                used.add(oid)
+        for j, det in enumerate(detections):
+            if j not in assigned:
+                assigned[j] = self.next_id
+                self.next_id += 1
+        new_objects, new_missing = {}, {}
+        for j, (x, y, area, box) in enumerate(detections):
+            oid = assigned[j]
+            new_objects[oid] = (x, y)
+            new_missing[oid] = 0
+        for oid in self.objects:
+            if oid not in new_objects:
+                m = self.missing.get(oid, 0) + 1
+                if m <= self.max_missing:
+                    new_objects[oid] = self.objects[oid]
+                    new_missing[oid] = m
+        self.objects, self.missing = new_objects, new_missing
+        return {assigned[j]: detections[j] for j in range(len(detections))}
+
+
+class ArtemiaAutoApp:
+    def __init__(self, root):
+        self.root = root
+        root.title(APP_TITLE)
+        root.geometry("820x620")
+        root.minsize(720, 540)
+        self.video_path = tk.StringVar()
+        self.min_area = tk.IntVar(value=10)
+        self.max_area = tk.IntVar(value=1800)
+        self.sensitivity = tk.IntVar(value=18)
+        self.frame_step = tk.IntVar(value=2)
+        self.status = tk.StringVar(value="Chọn video để bắt đầu.")
+        self.progress = tk.DoubleVar(value=0)
+        self._build()
+
+    def _build(self):
+        main = ttk.Frame(self.root, padding=14)
+        main.pack(fill="both", expand=True)
+        ttk.Label(main, text="ARTEMIA BIO-INDICATOR V2 AUTO",
+                  font=("Segoe UI", 17, "bold")).pack(anchor="w")
+        ttk.Label(main, text="Tự động phát hiện vùng chuyển động, gán ID và xuất video đánh dấu + CSV.",
+                  wraplength=760).pack(anchor="w", pady=(3, 12))
+
+        row = ttk.Frame(main); row.pack(fill="x", pady=4)
+        ttk.Entry(row, textvariable=self.video_path).pack(side="left", fill="x", expand=True)
+        ttk.Button(row, text="Chọn video", command=self.choose_video).pack(side="left", padx=(8,0))
+
+        settings = ttk.LabelFrame(main, text="Thông số phát hiện (cần hiệu chỉnh theo video)", padding=10)
+        settings.pack(fill="x", pady=10)
+        for r, (label, var, frm, to) in enumerate([
+            ("Ngưỡng thay đổi sáng", self.sensitivity, 5, 60),
+            ("Diện tích vùng nhỏ nhất (pixel)", self.min_area, 3, 300),
+            ("Diện tích vùng lớn nhất (pixel)", self.max_area, 100, 8000),
+            ("Xử lý mỗi N khung hình", self.frame_step, 1, 10),
+        ]):
+            ttk.Label(settings, text=label).grid(row=r, column=0, sticky="w", padx=5, pady=3)
+            ttk.Scale(settings, from_=frm, to=to, variable=var, orient="horizontal").grid(
+                row=r, column=1, sticky="ew", padx=8)
+            val = ttk.Label(settings, textvariable=var, width=6)
+            val.grid(row=r, column=2, sticky="e", padx=5)
+        settings.columnconfigure(1, weight=1)
+
+        buttons = ttk.Frame(main); buttons.pack(fill="x", pady=8)
+        self.run_btn = ttk.Button(buttons, text="TỰ ĐỘNG PHÂN TÍCH", command=self.start)
+        self.run_btn.pack(side="left")
+        ttk.Button(buttons, text="Mở thư mục kết quả", command=self.open_output).pack(side="left", padx=8)
+        ttk.Progressbar(main, variable=self.progress, maximum=100).pack(fill="x", pady=6)
+        ttk.Label(main, textvariable=self.status, wraplength=760).pack(anchor="w", pady=4)
+
+        info = ttk.LabelFrame(main, text="Kết quả và lưu ý", padding=10)
+        info.pack(fill="both", expand=True, pady=8)
+        self.result = tk.Text(info, height=12, wrap="word", font=("Consolas", 10))
+        self.result.pack(fill="both", expand=True)
+        self.result.insert("end",
+            "Quy trình:\\n"
+            "1. Chọn video quay từ trên xuống, camera cố định và đủ sáng.\\n"
+            "2. Nhấn TỰ ĐỘNG PHÂN TÍCH.\\n"
+            "3. Ứng dụng tạo video có khung/ID quanh vùng chuyển động và file CSV.\\n\\n"
+            "Giới hạn khoa học: đây là bản thử nghiệm dựa trên chuyển động ảnh, không phải mô hình AI đã học "
+            "để nhận dạng Artemia. Một cá thể có thể bị bỏ sót hoặc nhiều cá thể gần nhau bị gộp thành một vùng. "
+            "Cá thể không phát hiện chuyển động không đồng nghĩa đã chết. Cần kiểm tra thủ công một số khung hình.")
+        self.result.configure(state="disabled")
+
+    def choose_video(self):
+        p = filedialog.askopenfilename(filetypes=[("Video", "*.mp4 *.avi *.mov *.mkv"), ("All files", "*.*")])
+        if p:
+            self.video_path.set(p)
+
+    def start(self):
+        p = self.video_path.get().strip()
+        if not p or not os.path.isfile(p):
+            messagebox.showwarning("Thiếu video", "Vui lòng chọn một video hợp lệ.")
+            return
+        if self.min_area.get() >= self.max_area.get():
+            messagebox.showwarning("Thông số chưa hợp lệ", "Diện tích nhỏ nhất phải thấp hơn diện tích lớn nhất.")
+            return
+        self.run_btn.configure(state="disabled")
+        self.progress.set(0)
+        self.status.set("Đang phân tích... vui lòng chờ.")
+        threading.Thread(target=self.analyze, args=(p,), daemon=True).start()
+
+    def analyze(self, path):
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            self.done_error("Không mở được video.")
+            return
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if total <= 0 or w <= 0 or h <= 0:
+            cap.release(); self.done_error("Không đọc được thông tin video."); return
+
+        stem = os.path.splitext(path)[0]
+        out_video = stem + "_AUTO_ANNOTATED.mp4"
+        out_csv = stem + "_AUTO_RESULTS.csv"
+        writer = cv2.VideoWriter(out_video, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+        if not writer.isOpened():
+            cap.release(); self.done_error("Không tạo được video đầu ra. Hãy thử lưu video nguồn ở thư mục có quyền ghi."); return
+
+        subtractor = cv2.createBackgroundSubtractorMOG2(history=180, varThreshold=int(self.sensitivity.get()), detectShadows=False)
+        tracker = CentroidTracker(max_distance=max(30, int(min(w,h)*0.045)), max_missing=8)
+        step = max(1, int(self.frame_step.get()))
+        min_a, max_a = int(self.min_area.get()), int(self.max_area.get())
+        rows = []
+        active_ids = set()
+        frame_idx = 0
+        processed = 0
+        last_dets = {}
+        last_boxes = {}
+        # warm up and process frames; annotate every frame using latest detections
+        while True:
+            ok, frame = cap.read()
+            if not ok: break
+            if frame_idx % step == 0:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                gray = cv2.GaussianBlur(gray, (5,5), 0)
+                fg = subtractor.apply(gray, learningRate=0.003 if processed > 15 else 0.08)
+                _, mask = cv2.threshold(fg, 200, 255, cv2.THRESH_BINARY)
+                kernel = np.ones((3,3), np.uint8)
+                mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+                mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                dets = []
+                for c in contours:
+                    area = cv2.contourArea(c)
+                    if min_a <= area <= max_a:
+                        x,y,bw,bh = cv2.boundingRect(c)
+                        # discard very large, likely illumination/reflection changes
+                        if bw > w*0.25 or bh > h*0.25: continue
+                        dets.append((x+bw//2, y+bh//2, area, (x,y,bw,bh)))
+                tracked = tracker.update(dets)
+                last_dets = tracked
+                last_boxes = {oid: det[3] for oid, det in tracked.items()}
+                for oid, (x,y,area,box) in tracked.items():
+                    active_ids.add(oid)
+                    rows.append([frame_idx, round(frame_idx/fps,3), oid, x, y, round(area,1)])
+                processed += 1
+
+            # Draw last known detections, faded by persistence handled in tracker
+            for oid, box in last_boxes.items():
+                x,y,bw,bh = box
+                cv2.rectangle(frame, (x,y), (x+bw,y+bh), (40,220,40), 2)
+                cv2.putText(frame, f"ID {oid}", (x, max(18,y-5)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (40,220,40), 2)
+            cv2.putText(frame, f"Moving regions/IDs: {len(active_ids)} | frame {frame_idx}",
+                        (12,28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
+            writer.write(frame)
+            frame_idx += 1
+            if frame_idx % 10 == 0:
+                self.root.after(0, self.progress.set, min(99, frame_idx*100/total))
+        cap.release(); writer.release()
+
+        with open(out_csv, "w", newline="", encoding="utf-8-sig") as f:
+            cw = csv.writer(f)
+            cw.writerow(["frame", "time_seconds", "track_id", "center_x", "center_y", "contour_area_px"])
+            cw.writerows(rows)
+        summary = (
+            f"HOÀN TẤT\\n\\nVideo đầu vào: {os.path.basename(path)}\\n"
+            f"Kích thước: {w} x {h} | FPS: {fps:.2f} | Thời lượng: {total/fps:.1f} giây\\n"
+            f"Số khung hình xử lý: {processed}\\n"
+            f"Số ID/vùng chuyển động từng được gán: {len(active_ids)}\\n"
+            f"Số bản ghi tọa độ: {len(rows)}\\n\\n"
+            f"Video đánh dấu: {out_video}\\nCSV: {out_csv}\\n\\n"
+            "CHÚ Ý: 'ID/vùng chuyển động' không đảm bảo tương ứng 1-1 với số Artemia thật. "
+            "Các ID có thể bị tách/gộp hoặc thay đổi khi cá thể chồng lấp. Hãy kiểm tra video đầu ra "
+            "và đối chiếu đếm thủ công trước khi dùng số liệu trong báo cáo.")
+        self.root.after(0, self.done_success, summary)
+
+    def done_success(self, summary):
+        self.progress.set(100)
+        self.status.set("Phân tích hoàn tất.")
+        self.run_btn.configure(state="normal")
+        self.result.configure(state="normal")
+        self.result.delete("1.0", "end")
+        self.result.insert("end", summary)
+        self.result.configure(state="disabled")
+        messagebox.showinfo("Hoàn tất", "Đã xuất video đánh dấu và CSV cạnh video gốc.")
+
+    def done_error(self, msg):
+        self.root.after(0, self._show_error, msg)
+
+    def _show_error(self, msg):
+        self.run_btn.configure(state="normal")
+        self.status.set("Có lỗi khi phân tích.")
+        messagebox.showerror("Lỗi", msg)
+
+    def open_output(self):
+        p = self.video_path.get().strip()
+        if p and os.path.isfile(p):
+            folder = os.path.dirname(p)
+            try: os.startfile(folder)
+            except Exception: messagebox.showinfo("Thư mục", folder)
+        else:
+            messagebox.showinfo("Thông tin", "Hãy chọn video trước.")
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = ArtemiaAutoApp(root)
+    root.mainloop()
